@@ -1309,6 +1309,11 @@ if "ai_last_answer" not in st.session_state:
     st.session_state.ai_last_answer = ""
 if "ai_last_question" not in st.session_state:
     st.session_state.ai_last_question = ""
+if "ai_history" not in st.session_state:
+    st.session_state.ai_history = []
+if st.session_state.get("ai_clear_question"):
+    st.session_state.ai_question = ""
+    st.session_state.ai_clear_question = False
 
 with st.expander("Chiedi un approfondimento"):
     examples = st.columns(3)
@@ -1385,6 +1390,18 @@ with st.expander("Chiedi un approfondimento"):
                     answer = ask_gemini(ai_question, api_key, selected_ai_model)
                 st.session_state.ai_last_question = ai_question
                 st.session_state.ai_last_answer = answer
+                st.session_state.ai_history.insert(
+                    0,
+                    {
+                        "question": ai_question,
+                        "answer": answer,
+                        "model": selected_ai_model,
+                        "area": selected_area,
+                    },
+                )
+                st.session_state.ai_history = st.session_state.ai_history[:10]
+                st.session_state.ai_clear_question = True
+                st.rerun()
             except Exception as exc:
                 st.error(f"Errore nella chiamata IA: {exc}")
 
@@ -1407,6 +1424,28 @@ with st.expander("Chiedi un approfondimento"):
                 "Scarica risposta IA (.md)",
                 data=ai_export.encode("utf-8"),
                 file_name="approfondimento_ia.md",
+                mime="text/markdown",
+                width="stretch",
+            )
+
+    if st.session_state.ai_history:
+        with st.expander("Storico domande IA"):
+            history_export_parts = ["# Storico approfondimenti IA\n"]
+            for idx, item in enumerate(st.session_state.ai_history, start=1):
+                st.markdown(f"**{idx}. {item['question']}**")
+                st.caption(f"Area: {item['area']} | Modello: {item['model']}")
+                st.markdown(item["answer"])
+                st.divider()
+                history_export_parts.append(
+                    f"## {idx}. Domanda\n\n{item['question']}\n\n"
+                    f"Area: {item['area']}  \nModello: {item['model']}\n\n"
+                    f"### Risposta\n\n{item['answer']}\n"
+                )
+
+            st.download_button(
+                "Scarica storico IA (.md)",
+                data="\n".join(history_export_parts).encode("utf-8"),
+                file_name="storico_approfondimenti_ia.md",
                 mime="text/markdown",
                 width="stretch",
             )
