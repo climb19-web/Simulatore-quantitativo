@@ -1,6 +1,9 @@
 import datetime
+import json
 import math
 import os
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 import numpy as np
@@ -166,6 +169,7 @@ def select_area_footprint(df: pd.DataFrame, area: str) -> pd.DataFrame:
         .first()
         .drop(columns=["_quality_rank"], errors="ignore")
     )
+    area_df["Rapporto Area"] = area_df["EFConsTotGHA"] / area_df["BiocapTotGHA"]
     return area_df.sort_values("Anno").reset_index(drop=True)
 
 
@@ -383,11 +387,25 @@ def practical_interpretation(params: dict, baseline_row: pd.Series) -> dict:
     extra_biocap_km2_million = extra_biocap_gha * 10
 
     cumulative_removal = params["rimozione_co2"] * years / 2
+    energy_baseline = get_energy_baseline(selected_area)
+    energy_final = energy_mix_for_progress(params, 1.0, selected_area)
+    fossil_base = energy_fossil_share(energy_baseline)
+    fossil_final = energy_fossil_share(energy_final)
+    fossil_share_factor = fossil_final / fossil_base if fossil_base > 0 else 1.0
+    explicit_carbon_factor = 1 - params["leva_carbonio"] / 100
+    efficiency_factor = 1 - params["efficienza_energia"] / 100
+    effective_carbon_factor = max(0.0, explicit_carbon_factor * fossil_share_factor * efficiency_factor)
+    effective_carbon_reduction = (1 - effective_carbon_factor) * 100
+    energy_only_reduction = (1 - max(0.0, fossil_share_factor * efficiency_factor)) * 100
+    fossil_points_reduction = fossil_base - fossil_final
 
     return {
         "meat_target": meat_target,
         "meat_reduction": meat_reduction,
         "carbon_reduction": params["leva_carbonio"],
+        "effective_carbon_reduction": effective_carbon_reduction,
+        "energy_only_reduction": energy_only_reduction,
+        "fossil_points_reduction": fossil_points_reduction,
         "food_reduction": params["leva_dieta"],
         "extra_biocap_gha": extra_biocap_gha,
         "extra_biocap_km2_million": extra_biocap_km2_million,
@@ -450,6 +468,7 @@ def get_configured_gemini_key(manual_key: str = "") -> str:
 
 
 def build_ai_context() -> str:
+    context_ratio_unit = "Terre" if selected_area.lower() == "mondo" else "Europe"
     return f"""
 Scenario corrente del simulatore:
 - Area dati: {selected_area}
@@ -467,7 +486,7 @@ Scenario corrente del simulatore:
 Risultati 2075:
 - Impronta: {last['Impronta Totale (Gha)']:.2f} Gha
 - Biocapacita: {last['Biocapacita (Gha)']:.2f} Gha
-- Rapporto: {last['Rapporto (Terre)']:.2f}
+- Rapporto: {last['Rapporto (Terre)']:.2f} {context_ratio_unit}
 - Emissioni nette: {last['Emissioni Nette (GtCO2/anno)']:.1f} GtCO2/anno
 - CO2 atmosferica: {last['CO2 (ppm)']:.0f} ppm
 - Temperatura: +{last['Temperatura (C)']:.2f} C
@@ -476,27 +495,63 @@ Risultati 2075:
 
 
 def ask_gemini(question: str, api_key: str, model_name: str) -> str:
-    from google import genai
-
-    client = genai.Client(api_key=api_key)
     prompt = f"""
-Sei un assistente didattico per un simulatore eco-evolutivo.
-Rispondi in italiano, in modo chiaro e sintetico.
+Sei un assistente IA generale integrato in un simulatore eco-evolutivo.
+Rispondi in italiano, in modo chiaro, utile e proporzionato alla domanda.
 
 Regole:
-- Distingui sempre tra dati del simulatore, dati ufficiali citati dal modello e stime generali.
-- Non presentare come certo un dato che non e presente nel contesto.
-- Se la domanda richiede dati esterni non inclusi nel simulatore, dichiaralo e offri una stima o un modo per approfondire.
-- Non modificare i risultati del modello: spiega, interpreta, contestualizza.
+- Puoi rispondere anche a domande generali, non limitate al simulatore.
+- Se la domanda riguarda lo scenario corrente, usa il contesto del modello qui sotto.
+- Se la domanda richiede conoscenze esterne, rispondi come assistente generale e segnala quando stai usando conoscenza generale o stime.
+- Distingui quando opportuno tra dati del simulatore, dati ufficiali citati dal modello, stime e spiegazioni generali.
+- Non modificare i risultati del modello: puoi interpretarli, confrontarli e contestualizzarli.
 
-Contesto del modello:
+Contesto dello scenario corrente, da usare solo se rilevante:
 {build_ai_context()}
 
 Domanda dell'utente:
 {question}
 """
-    response = client.models.generate_content(model=model_name, contents=prompt)
-    return getattr(response, "text", "") or str(response)
+    endpoint = (
+        f"https://generativelanguage.googleapis.com/v1beta/models/"
+        f"{model_name}:generateContent"
+    )
+    payload = {
+        "contents": [
+            {
+                "role": "user",
+                "parts": [{"text": prompt}],
+            }
+        ]
+    }
+    request = urllib.request.Request(
+        endpoint,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json", "x-goog-api-key": api_key},
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(request, timeout=60) as response:
+            data = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        if exc.code == 400 and "API_KEY_INVALID" in detail:
+            raise RuntimeError(
+                "API key Gemini non valida. Controlla di aver copiato la chiave completa da Google AI Studio, "
+                "senza spazi o virgolette, e che la chiave sia abilitata per Gemini/Generative Language API."
+            ) from exc
+        raise RuntimeError(f"Errore Gemini HTTP {exc.code}: {detail}") from exc
+
+    candidates = data.get("candidates", [])
+    if not candidates:
+        raise RuntimeError(f"Nessuna risposta Gemini ricevuta: {data}")
+
+    parts = candidates[0].get("content", {}).get("parts", [])
+    text_parts = [part.get("text", "") for part in parts if part.get("text")]
+    if not text_parts:
+        raise RuntimeError(f"Risposta Gemini senza testo: {data}")
+    return "\n".join(text_parts)
 
 
 def component_value(row: pd.Series, col: str) -> float:
@@ -535,6 +590,7 @@ def run_model(params: dict) -> pd.DataFrame:
     base_carbon_ef = max(base_components.get("EF Carbon", 0.0), 1e-9)
 
     cumulative_atmospheric_gtco2 = 0.0
+    cumulative_atmospheric_without_removal_gtco2 = 0.0
     cumulative_gross_emissions = 0.0
     cumulative_removed = 0.0
     rows = []
@@ -547,7 +603,9 @@ def run_model(params: dict) -> pd.DataFrame:
         un_growth_factor = un_population / UN_POP_VALUES[0]
         reference_population = base_population * un_growth_factor
         population = reference_population * ((1 + params["deviazione_pop"] / 100) ** step)
-        population_factor = population / base_population if base_population > 0 else 1.0
+        # Il trend impronta e gia calcolato sull'impronta totale osservata/proiettata.
+        # La popolazione modifica l'impronta solo se l'utente imposta una deviazione dal trend base.
+        population_factor = (1 + params["deviazione_pop"] / 100) ** step
         energy_baseline = get_energy_baseline(selected_area)
         energy_mix = energy_mix_for_progress(params, progress, selected_area)
         fossil_share_factor = energy_fossil_share(energy_mix) / energy_fossil_share(energy_baseline)
@@ -572,12 +630,12 @@ def run_model(params: dict) -> pd.DataFrame:
 
         ef_total = sum(ef_parts.values())
 
-        ppm = CARBON_PARAMS["baseline_ppm"] + (
+        ppm_for_damage = CARBON_PARAMS["baseline_ppm"] + (
             cumulative_atmospheric_gtco2 / CARBON_PARAMS["ppm_per_gtco2"]
         )
-        temperature = temp_from_ppm(ppm)
+        temperature_for_damage = temp_from_ppm(ppm_for_damage)
 
-        climate_damage = max(0.0, temperature - 1.5) * (params["danno_clima"] / 100)
+        climate_damage = max(0.0, temperature_for_damage - 1.5) * (params["danno_clima"] / 100)
         biocap_total = base_biocap_total * biocap_growth * ((1 - climate_damage) ** step)
         biocap_total = max(biocap_total, 0.0)
 
@@ -589,6 +647,16 @@ def run_model(params: dict) -> pd.DataFrame:
 
         cumulative_gross_emissions += gross_emissions
         cumulative_removed += removed
+        cumulative_atmospheric_gtco2 += net_emissions * CARBON_PARAMS["airborne_fraction"]
+        cumulative_atmospheric_without_removal_gtco2 += gross_emissions * CARBON_PARAMS["airborne_fraction"]
+
+        ppm = CARBON_PARAMS["baseline_ppm"] + (
+            cumulative_atmospheric_gtco2 / CARBON_PARAMS["ppm_per_gtco2"]
+        )
+        ppm_without_removal = CARBON_PARAMS["baseline_ppm"] + (
+            cumulative_atmospheric_without_removal_gtco2 / CARBON_PARAMS["ppm_per_gtco2"]
+        )
+        temperature = temp_from_ppm(ppm)
 
         ratio_earths = ef_total / biocap_total if biocap_total > 0 else float("inf")
         saldo = biocap_total - ef_total
@@ -614,6 +682,7 @@ def run_model(params: dict) -> pd.DataFrame:
                 "CO2 Rimossa Cumulativa (GtCO2)": cumulative_removed,
                 "CO2 Atmosferica Aggiuntiva (GtCO2)": cumulative_atmospheric_gtco2,
                 "CO2 (ppm)": ppm,
+                "CO2 senza rimozione (ppm)": ppm_without_removal,
                 "Temperatura (C)": temperature,
                 "Overshoot Day": overshoot_day(year, ratio_earths),
                 "is_overshoot": ratio_earths > 1,
@@ -627,10 +696,6 @@ def run_model(params: dict) -> pd.DataFrame:
                 "Bioenergie e altro (%)": energy_mix["Bioenergie e altro"],
                 "Efficienza energia (%)": params["efficienza_energia"] * progress,
             }
-        )
-
-        cumulative_atmospheric_gtco2 += (
-            net_emissions * CARBON_PARAMS["airborne_fraction"]
         )
 
     return pd.DataFrame(rows)
@@ -845,6 +910,10 @@ df_display = df.rename(
 )
 last = df.iloc[-1]
 practical = practical_interpretation(params, baseline)
+ratio_unit_label = "Terre" if selected_area.lower() == "mondo" else "Europe"
+ratio_unit_singular = "Terra" if selected_area.lower() == "mondo" else "Europa"
+ratio_display_col = f"Rapporto ({ratio_unit_label})"
+df_display = df_display.rename(columns={"Rapporto (Terre)": ratio_display_col})
 
 
 # ============================================================================
@@ -855,7 +924,7 @@ st.subheader("Indicatori chiave 2075")
 kpi1, kpi2, kpi3, kpi4, kpi5, kpi6 = st.columns(6)
 
 with kpi1:
-    st.metric("Rapporto", f"{last['Rapporto (Terre)']:.2f} Terre")
+    st.metric("Rapporto", f"{last['Rapporto (Terre)']:.2f} {ratio_unit_label}")
 with kpi2:
     st.metric(
         "Impronta",
@@ -901,9 +970,13 @@ if selected_area.lower() == "mondo":
         )
     with pr_col2:
         st.metric(
-            "Decarbonizzazione media",
-            f"{practical['carbon_reduction']:.0f}%",
-            help="Stima semplificata: interpreta la riduzione impronta carbonio come quota della componente carbonio portata a basse emissioni entro il 2075.",
+            "Decarb. effettiva stimata",
+            f"{practical['effective_carbon_reduction']:.0f}%",
+            f"energia {practical['energy_only_reduction']:.0f}%",
+            help=(
+                "Stima semplificata dell'effetto combinato su carbonio: riduzione impronta carbonio, "
+                "sostituzione dei fossili con rinnovabili/nucleare ed efficienza energetica."
+            ),
         )
     with pr_col3:
         st.metric(
@@ -920,7 +993,7 @@ if selected_area.lower() == "mondo":
             help="La rimozione cresce linearmente da 0 nel 2026 al valore scelto nel 2075.",
         )
     st.caption(
-        "Queste equivalenze sono esempi didattici, non conversioni ufficiali: servono a rendere leggibili le leve dello scenario globale."
+        "Queste equivalenze sono esempi didattici, non conversioni ufficiali. La decarbonizzazione stimata include anche rinnovabili, nucleare ed efficienza energetica."
     )
 else:
     st.caption(
@@ -988,8 +1061,8 @@ if not world_data.empty:
     fig_ratio.add_trace(
         go.Scatter(
             x=world_data["Anno"],
-            y=world_data["Numero di Terre consumate"],
-            name="Terre storiche",
+            y=world_data["Rapporto Area"],
+            name=f"{ratio_unit_label} storiche",
             line=dict(color="#7c3aed", width=2),
         )
     )
@@ -998,19 +1071,34 @@ fig_ratio.add_trace(
     go.Scatter(
         x=df["Anno"],
         y=df["Rapporto (Terre)"],
-        name="Terre proiettate",
+        name=f"{ratio_unit_label} proiettate",
         line=dict(color="#f59e0b", width=3, dash="dash"),
     )
 )
-fig_ratio.add_hline(y=1.0, line_dash="dash", line_color="black", annotation_text="1 Terra")
+fig_ratio.add_hline(y=1.0, line_dash="dash", line_color="black", annotation_text=f"1 {ratio_unit_singular}")
+fig_ratio.add_vline(
+    x=START_YEAR,
+    line_dash="dot",
+    line_color="rgba(100, 116, 139, 0.7)",
+    annotation_text="inizio proiezione",
+)
 fig_ratio.update_layout(
     xaxis_title="Anno",
-    yaxis_title="Numero di Terre",
+    yaxis_title=f"Numero di {ratio_unit_label}",
     hovermode="x unified",
     height=360,
     template="plotly_white",
 )
 st.plotly_chart(fig_ratio, width="stretch")
+st.caption(
+    f"Linea viola: dati ufficiali Footprint storici. Linea arancione tratteggiata: proiezione del modello dal {START_YEAR} al {END_YEAR}."
+)
+if selected_area.lower() == "europa":
+    st.caption(
+        "Nota Europa: il grafico mostra quante Europe servirebbero per sostenere i consumi europei "
+        "(impronta totale europea / biocapacita europea). Questo e diverso da 'Numero di Terre consumate', "
+        "che indica quante Terre servirebbero se tutti vivessero con il consumo medio europeo."
+    )
 
 
 st.subheader("Emissioni CO2 e concentrazione atmosferica")
@@ -1035,6 +1123,17 @@ fig_carbon.add_trace(
     ),
     secondary_y=False,
 )
+if float(df["Rimozione CO2 (GtCO2/anno)"].max()) > 0:
+    fig_carbon.add_trace(
+        go.Bar(
+            x=df["Anno"],
+            y=-df["Rimozione CO2 (GtCO2/anno)"],
+            name="CO2 rimossa",
+            marker_color="rgba(16, 185, 129, 0.45)",
+            opacity=0.8,
+        ),
+        secondary_y=False,
+    )
 fig_carbon.add_trace(
     go.Scatter(
         x=df["Anno"],
@@ -1046,8 +1145,19 @@ fig_carbon.add_trace(
     ),
     secondary_y=True,
 )
-ppm_min = float(df["CO2 (ppm)"].min())
-ppm_max = float(df["CO2 (ppm)"].max())
+if float(df["Rimozione CO2 (GtCO2/anno)"].max()) > 0:
+    fig_carbon.add_trace(
+        go.Scatter(
+            x=df["Anno"],
+            y=df["CO2 senza rimozione (ppm)"],
+            name="CO2 ppm senza rimozione",
+            line=dict(color="rgba(17, 24, 39, 0.45)", width=3, dash="dash"),
+            mode="lines",
+        ),
+        secondary_y=True,
+    )
+ppm_min = float(min(df["CO2 (ppm)"].min(), df["CO2 senza rimozione (ppm)"].min()))
+ppm_max = float(max(df["CO2 (ppm)"].max(), df["CO2 senza rimozione (ppm)"].max()))
 ppm_padding = max(5.0, (ppm_max - ppm_min) * 0.12)
 fig_carbon.update_yaxes(title_text="GtCO2/anno", secondary_y=False)
 fig_carbon.update_yaxes(
@@ -1069,6 +1179,11 @@ st.plotly_chart(fig_carbon, width="stretch")
 st.caption(
     "Le emissioni sono flussi annuali; i ppm rappresentano lo stock atmosferico cumulato. Il modello usa CO2, non CO2e."
 )
+if float(df["Rimozione CO2 (GtCO2/anno)"].max()) > 0:
+    ppm_avoided = last["CO2 senza rimozione (ppm)"] - last["CO2 (ppm)"]
+    st.caption(
+        f"Effetto rimozione CO2 nello scenario: circa {ppm_avoided:.1f} ppm evitati al 2075 rispetto allo stesso scenario senza rimozione."
+    )
 
 
 st.subheader("Mix energetico globale semplificato")
@@ -1156,7 +1271,8 @@ display_cols = [
     "Impronta carbonio (Gha)",
     "Impronta coltivazioni (Gha)",
     "Impronta pascolo (Gha)",
-    "Rapporto (Terre)",
+    ratio_display_col,
+    "Rimozione CO2 (GtCO2/anno)",
     "Emissioni Nette (GtCO2/anno)",
     "CO2 (ppm)",
     "Temperatura (C)",
@@ -1175,7 +1291,7 @@ st.dataframe(
 st.divider()
 st.subheader("Approfondisci con IA")
 st.caption(
-    "Modulo opzionale: usa Gemini per spiegare aspetti dello scenario. L'IA non modifica i calcoli del simulatore."
+    "Modulo opzionale: usa Gemini per domande generali o per spiegare aspetti dello scenario. L'IA non modifica i calcoli del simulatore."
 )
 
 if "ai_question" not in st.session_state:
@@ -1201,7 +1317,21 @@ with st.expander("Chiedi un approfondimento"):
             help="Esempio: chiedi chiarimenti su alimentazione, energia, CO2, Europa/Mondo o risultati dello scenario.",
         )
     with ai_col2:
-        ai_model = st.text_input("Modello Gemini", value="gemini-2.5-flash")
+        ai_model_choice = st.selectbox(
+            "Modello Gemini",
+            [
+                "gemini-2.5-flash",
+                "gemini-2.5-pro",
+                "gemini-2.0-flash",
+                "gemini-1.5-flash",
+                "gemini-1.5-pro",
+                "Personalizzato",
+            ],
+            help="Flash e piu rapido/economico; Pro e piu adatto a ragionamenti lunghi.",
+        )
+        custom_ai_model = ""
+        if ai_model_choice == "Personalizzato":
+            custom_ai_model = st.text_input("Nome modello personalizzato", value="")
         manual_api_key = st.text_input(
             "Google/Gemini API key",
             type="password",
@@ -1220,10 +1350,13 @@ with st.expander("Chiedi un approfondimento"):
         else:
             try:
                 with st.spinner("Sto generando l'approfondimento..."):
-                    answer = ask_gemini(ai_question, api_key, ai_model.strip() or "gemini-2.5-flash")
+                    selected_ai_model = (
+                        custom_ai_model.strip()
+                        if ai_model_choice == "Personalizzato" and custom_ai_model.strip()
+                        else ai_model_choice
+                    )
+                    answer = ask_gemini(ai_question, api_key, selected_ai_model)
                 st.markdown(answer)
-            except ModuleNotFoundError:
-                st.error("Modulo google-genai non installato. Esegui: pip install google-genai")
             except Exception as exc:
                 st.error(f"Errore nella chiamata IA: {exc}")
 
@@ -1462,7 +1595,9 @@ with st.expander("Significato dei parametri nella barra laterale"):
 
         Il modello usa una traiettoria ONU semplificata. Questo parametro permette di deviare da quella traiettoria.
 
-        Esempio: `0%` segue la proiezione ONU. `-0,20%` simula una popolazione futura un po' piu bassa del previsto. `+0,20%` simula una popolazione piu alta.
+        Esempio: `0%` segue la proiezione di base. `-0,20%` simula una popolazione futura un po' piu bassa del previsto. `+0,20%` simula una popolazione piu alta.
+
+        Nota: il trend dell'impronta totale deriva gia dai dati Footprint complessivi. Per questo la popolazione non viene conteggiata due volte: modifica l'impronta solo quando imposti una deviazione diversa da zero.
 
         **Aumento rinnovabili moderne al 2075 (punti %)**
 
@@ -1541,7 +1676,7 @@ if selected_area.lower() == "mondo":
             100% -> componente carbonio quasi azzerata nello scenario
             ```
 
-            Nello scenario corrente la riduzione al 2075 e **{practical['carbon_reduction']:.0f}%**.
+            Nello scenario corrente la leva diretta di riduzione carbonio e **{practical['carbon_reduction']:.0f}%**, ma l'effetto stimato complessivo su carbonio, includendo mix energetico ed efficienza, e circa **{practical['effective_carbon_reduction']:.0f}%**.
 
             **3. Extra crescita biocapacita**
 
@@ -1640,7 +1775,7 @@ with st.expander("Esempi di scenari da provare"):
         Riduzione impronta agro-alimentare: 0%
         ```
 
-        Confronta soprattutto tre risultati: `Rapporto (Terre)`, `CO2 (ppm)` e `Temperatura (C)`.
+        Confronta soprattutto tre risultati: `Rapporto`, `CO2 (ppm)` e `Temperatura (C)`.
         """
     )
 
@@ -1679,12 +1814,13 @@ Efficienza energia al 2075: {params['efficienza_energia']:.1f}%
 Risultati 2075:
 Impronta: {last['Impronta Totale (Gha)']:.2f} Gha
 Biocapacita: {last['Biocapacita (Gha)']:.2f} Gha
-Rapporto: {last['Rapporto (Terre)']:.2f} Terre
+Rapporto: {last['Rapporto (Terre)']:.2f} {ratio_unit_label}
 Emissioni nette: {last['Emissioni Nette (GtCO2/anno)']:.1f} GtCO2/anno
 Energia fossile: {last['Energia fossile (%)']:.1f}%
 Rinnovabili moderne: {last['Rinnovabili moderne (%)']:.1f}%
 Nucleare: {last['Nucleare (%)']:.1f}%
 CO2: {last['CO2 (ppm)']:.0f} ppm
+CO2 senza rimozione: {last['CO2 senza rimozione (ppm)']:.0f} ppm
 Temperatura: +{last['Temperatura (C)']:.2f} C
 Overshoot Day: {last['Overshoot Day']}
 """
