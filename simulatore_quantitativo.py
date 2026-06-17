@@ -1289,7 +1289,14 @@ st.dataframe(
 
 
 st.divider()
-st.subheader("Approfondisci con IA")
+st.markdown(
+    """
+    <div style="border-left: 5px solid #f59e0b; padding: 0.35rem 0 0.35rem 0.8rem; margin-bottom: 0.35rem;">
+        <h3 style="color: #f59e0b; margin: 0;">Approfondisci con IA</h3>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
 st.caption(
     "Modulo opzionale: usa Gemini per domande generali o per spiegare aspetti dello scenario. L'IA non modifica i calcoli del simulatore."
 )
@@ -1298,6 +1305,10 @@ if "ai_question" not in st.session_state:
     st.session_state.ai_question = (
         "Il consumo medio di carne indicato nel modello come puo essere suddiviso tra bovino, suino, pollame e altri tipi?"
     )
+if "ai_last_answer" not in st.session_state:
+    st.session_state.ai_last_answer = ""
+if "ai_last_question" not in st.session_state:
+    st.session_state.ai_last_question = ""
 
 with st.expander("Chiedi un approfondimento"):
     examples = st.columns(3)
@@ -1335,9 +1346,25 @@ with st.expander("Chiedi un approfondimento"):
         manual_api_key = st.text_input(
             "Google/Gemini API key",
             type="password",
-            help="Opzionale se hai gia configurato GEMINI_API_KEY o GOOGLE_API_KEY in Streamlit secrets o nelle variabili ambiente.",
+            help=(
+                "Puoi creare una API key gratuita in Google AI Studio: vai su "
+                "https://aistudio.google.com/app/apikey, accedi con Google, scegli Create API key, "
+                "copia la chiave e incollala qui. In alternativa configura GEMINI_API_KEY o GOOGLE_API_KEY."
+            ),
         )
         st.caption("La chiave inserita qui non viene salvata nel codice.")
+        with st.expander("Come creare una API key gratuita"):
+            st.markdown(
+                """
+                1. Vai su [Google AI Studio](https://aistudio.google.com/app/apikey).
+                2. Accedi con il tuo account Google.
+                3. Clicca **Create API key**.
+                4. Copia la chiave generata.
+                5. Incollala nel campo password qui sopra.
+
+                Nota: le quote gratuite e le condizioni possono cambiare nel tempo. Controlla sempre i limiti indicati da Google.
+                """
+            )
 
     if st.button("Genera approfondimento IA", width="stretch"):
         api_key = get_configured_gemini_key(manual_api_key)
@@ -1356,9 +1383,33 @@ with st.expander("Chiedi un approfondimento"):
                         else ai_model_choice
                     )
                     answer = ask_gemini(ai_question, api_key, selected_ai_model)
-                st.markdown(answer)
+                st.session_state.ai_last_question = ai_question
+                st.session_state.ai_last_answer = answer
             except Exception as exc:
                 st.error(f"Errore nella chiamata IA: {exc}")
+
+    if st.session_state.ai_last_answer:
+        st.markdown("#### Risposta IA")
+        st.markdown(st.session_state.ai_last_answer)
+
+        ai_export = (
+            "# Approfondimento IA\n\n"
+            f"## Domanda\n\n{st.session_state.ai_last_question}\n\n"
+            f"## Risposta\n\n{st.session_state.ai_last_answer}\n"
+        )
+        copy_col, save_col = st.columns([1, 1])
+        with copy_col:
+            with st.expander("Copia risposta"):
+                st.caption("Usa l'icona di copia del blocco qui sotto.")
+                st.code(st.session_state.ai_last_answer, language="markdown")
+        with save_col:
+            st.download_button(
+                "Scarica risposta IA (.md)",
+                data=ai_export.encode("utf-8"),
+                file_name="approfondimento_ia.md",
+                mime="text/markdown",
+                width="stretch",
+            )
 
 
 st.divider()
