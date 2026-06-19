@@ -28,6 +28,19 @@ st.caption(
     "Modello data-informed: biocapacita, impronta ecologica, emissioni CO2, ppm e temperatura."
 )
 
+st.markdown(
+    """
+    <style>
+    @media (max-width: 850px) {
+        [data-testid="stPlotlyChart"] * {
+            pointer-events: none !important;
+        }
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
 
 # ============================================================================
 # PARAMETRI DI MODELLO
@@ -36,6 +49,14 @@ st.caption(
 CSV_PATH = Path("export_custom_range.csv")
 START_YEAR = 2026
 END_YEAR = 2075
+
+PLOTLY_STATIC_CONFIG = {
+    "staticPlot": True,
+    "displayModeBar": False,
+    "scrollZoom": False,
+    "doubleClick": False,
+    "responsive": True,
+}
 
 # Valori climatici di riferimento. Le emissioni sono CO2, non CO2e.
 CARBON_PARAMS = {
@@ -1047,7 +1068,7 @@ fig_main.update_layout(
     height=440,
     template="plotly_white",
 )
-st.plotly_chart(fig_main, width="stretch")
+st.plotly_chart(fig_main, width="stretch", config=PLOTLY_STATIC_CONFIG)
 
 st.caption(
     "L'equilibrio non e una soglia fissa a 1 Gha: avviene quando la linea dell'impronta incontra la linea della biocapacita."
@@ -1089,7 +1110,7 @@ fig_ratio.update_layout(
     height=360,
     template="plotly_white",
 )
-st.plotly_chart(fig_ratio, width="stretch")
+st.plotly_chart(fig_ratio, width="stretch", config=PLOTLY_STATIC_CONFIG)
 st.caption(
     f"Linea viola: dati ufficiali Footprint storici. Linea arancione tratteggiata: proiezione del modello dal {START_YEAR} al {END_YEAR}."
 )
@@ -1174,7 +1195,7 @@ fig_carbon.update_layout(
     barmode="overlay",
     legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
 )
-st.plotly_chart(fig_carbon, width="stretch")
+st.plotly_chart(fig_carbon, width="stretch", config=PLOTLY_STATIC_CONFIG)
 
 st.caption(
     "Le emissioni sono flussi annuali; i ppm rappresentano lo stock atmosferico cumulato. Il modello usa CO2, non CO2e."
@@ -1214,7 +1235,7 @@ fig_energy.update_layout(
     height=420,
     template="plotly_white",
 )
-st.plotly_chart(fig_energy, width="stretch")
+st.plotly_chart(fig_energy, width="stretch", config=PLOTLY_STATIC_CONFIG)
 st.caption(
     f"Modulo semplificato basato sul mix iniziale {selected_area}: rinnovabili e nucleare sostituiscono progressivamente petrolio, carbone e gas; l'efficienza riduce la domanda energetica."
 )
@@ -1258,7 +1279,7 @@ fig_parts.update_layout(
     height=420,
     template="plotly_white",
 )
-st.plotly_chart(fig_parts, width="stretch")
+st.plotly_chart(fig_parts, width="stretch", config=PLOTLY_STATIC_CONFIG)
 
 
 st.divider()
